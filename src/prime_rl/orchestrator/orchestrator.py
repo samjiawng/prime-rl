@@ -687,6 +687,20 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
+        group_version_stats = self.train_sink.group_version_stats
+        if group_version_stats:
+            spreads = [s for s, _, _ in group_version_stats]
+            n_distincts = [n for _, n, _ in group_version_stats]
+            frac_off_modals = [f for _, _, f in group_version_stats]
+            metrics["train/agg/group_version/spread_frac_nonzero"] = sum(s > 0 for s in spreads) / len(spreads)
+            metrics["train/agg/group_version/spread_mean"] = sum(spreads) / len(spreads)
+            metrics["train/agg/group_version/spread_max"] = max(spreads)
+            metrics["train/agg/group_version/n_distinct_mean"] = sum(n_distincts) / len(n_distincts)
+            metrics["train/agg/group_version/frac_off_modal_mean"] = sum(frac_off_modals) / len(frac_off_modals)
+        # Logged unconditionally (not gated behind ``if group_version_stats``) — a
+        # dense metric that's meaningfully 0 on most steps, same reasoning as
+        # DispatcherMetrics.drained() always emitting its full key set.
+        metrics["train/agg/group_version/num_unstamped"] = float(self.train_sink.num_unstamped_members)
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)
@@ -716,6 +730,7 @@ class Orchestrator:
         self.log_train_batch(batch, step=step, step_time=step_time)
 
         self.train_sink.reset_pre_filter_stats()
+        self.train_sink.reset_group_version_stats()
         self.maybe_trigger_eval(self.progress.step)
         trim_process_memory()
 

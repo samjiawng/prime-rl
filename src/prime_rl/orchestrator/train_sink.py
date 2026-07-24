@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.envs import TrainEnvs
@@ -93,6 +93,19 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
+
+        # Per-group intra-group policy-version drift, one entry per group that had
+        # at least one stamped member since the last ship: (spread, n_distinct,
+        # frac_off_modal). A fully-unstamped group contributes no entry here (see
+        # num_unstamped_members) — recording it as (0, 0, 0.0) would read as "zero
+        # drift" and deflate spread_frac_nonzero / the means for a group that
+        # actually carries no drift information at all. Reset by the orchestrator
+        # via ``reset_group_version_stats``.
+        self.group_version_stats: list[tuple[int, int, float]] = []
+        # Count of unstamped (``policy_version_at_completion is None``) members
+        # across all finalized groups since the last ship — incremented for every
+        # group, including fully-unstamped ones. Reset alongside group_version_stats.
+        self.num_unstamped_members: int = 0
 
     def group_size_for(self, env_name: str) -> int:
         return self.train_envs.get(env_name).config.group_size
@@ -177,6 +190,15 @@ class TrainSink:
         self.pending_group_episodes.pop(group_id, None)
         if not group:
             return
+
+        # Invariant canary, not a real-world count: every rollout the dispatcher
+        # emits — survivor, errored, or off-policy-cancelled — is stamped with
+        # ``policy_version_at_completion`` by ``emit_episode`` (see types.py; no
+        # live path leaves it ``None``). This should stay at 0; a nonzero value
+        # means some path stopped stamping, and the group-version-drift stats
+        # below (scoped to ``survivors``) are silently missing data for it.
+        self.num_unstamped_members += sum(1 for r in group if r.policy_version_at_completion is None)
+
         # Window membership follows group finalization, not arrival: a rollout
         # only becomes observable (metrics / persistence) once its whole group
         # is finalized, so a batch's window never claims rollouts of a group
@@ -205,6 +227,28 @@ class TrainSink:
                 f"rollouts={len(group)} (errored={num_errored}) | dropped: no trainable survivors"
             )
             return
+
+        # Intra-group policy drift, scoped to exactly the members entering the
+        # advantage baseline next (``GRPOAlgorithm.score_group`` receives this
+        # same ``survivors`` list). Errored/cancelled/untrainable rows are
+        # excluded by the survivors filters above — not because they're
+        # unstamped (they are stamped; see ``num_unstamped_members``) but
+        # because they never enter the baseline, so their completion version
+        # shouldn't count as measured "drift" either. ``spread`` alone
+        # collapses a distribution to a range (one 5-versions-late straggler
+        # looks identical to an even 5-way split), so record shape alongside
+        # it: how many distinct versions touched the survivors, and what
+        # fraction disagrees with the majority. ``survivors`` is already
+        # non-empty here; the ``if stamped`` guard only protects against the
+        # ``num_unstamped_members`` invariant being violated for one of them.
+        versions = [r.policy_version_at_completion for r in survivors]
+        stamped = [v for v in versions if v is not None]
+        if stamped:
+            _, modal_count = Counter(stamped).most_common(1)[0]
+            spread = max(stamped) - min(stamped)
+            n_distinct = len(set(stamped))
+            frac_off_modal = 1.0 - modal_count / len(stamped)
+            self.group_version_stats.append((spread, n_distinct, frac_off_modal))
 
         # Advantages + per-sample wire stamping (advantage stream, loss
         # routing) are the algorithm's job (finalize_group); the sink only
@@ -294,3 +338,7 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name.clear()
+
+    def reset_group_version_stats(self) -> None:
+        self.group_version_stats.clear()
+        self.num_unstamped_members = 0

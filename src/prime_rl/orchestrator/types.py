@@ -96,6 +96,22 @@ class Rollout(vf.Trace[DataT], Generic[DataT]):
     episode_id: str = Field(default="", exclude=True)
     policy_version: int = Field(default=0, exclude=True)
     off_policy_steps: int = Field(default=0, exclude=True)
+    # Live ``policy.version`` at the moment the dispatcher *collected* this rollout —
+    # diagnostic only (never serialized: no trainer/checkpoint/trace consumer needs
+    # it). Unlike ``policy_version`` (fixed at group-open time), this reflects what
+    # actually happened during generation, so the sink can compare completion-time
+    # versions across a group's members to measure intra-group drift. Stamped at
+    # collection, not at true generation-completion time, so it's an upper bound
+    # on the generation version — and can compress spread toward zero if a stalled
+    # dispatcher drains a burst of completions in one tick (they all get stamped
+    # with whatever ``policy.version`` is current at that single tick). Every
+    # rollout the dispatcher emits — survivor, errored, or off-policy-cancelled —
+    # is stamped here (``emit_episode`` doesn't branch on ``ok``/``has_error``);
+    # ``None`` is not a real-world state on any current path, only a defensive
+    # default guarding against a future path that forgets to stamp. Error/cancel
+    # markers are excluded from the sink's group-version-drift stats via the
+    # ``survivors`` filter (not-errored + trainable), not via being ``None``.
+    policy_version_at_completion: int | None = Field(default=None, exclude=True)
     samples: list[TrainingSample] = Field(default_factory=list, exclude=True)
     # Per-token rl advantage stream, full-length-N (= len(token_ids)) per
     # sample, concatenated across the rollout's samples in order; 0.0 on
